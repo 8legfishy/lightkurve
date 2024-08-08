@@ -83,7 +83,7 @@ class Seismology(object):
         self.periodogram = periodogram
 
     def __repr__(self):
-        attrs = np.asarray(["numax", "deltanu", "mass", "radius", "logg"])
+        attrs = np.asarray(["numax", "deltanu", "deltap", "pemax", "mass", "radius", "logg"])
         tray = np.asarray([hasattr(self, attr) for attr in attrs])
         if tray.sum() == 0:
             tray_str = " - no values have been computed so far."
@@ -617,6 +617,420 @@ class Seismology(object):
                     l_button,
                     Spacer(width=25),
                     dnu_slider,
+                    Spacer(width=30),
+                    r_button,
+                    Spacer(width=23),
+                    rr_button,
+                ],
+            )
+            doc.add_root(widgets_and_figures)
+
+        output_notebook(verbose=False, hide_banner=True)
+        return show(create_interact_ui, notebook_url=notebook_url)
+
+    def _clean_echelle_p(
+        self,
+        deltap=None,
+        pemax=None,
+        minimum_period=None,
+        maximum_period=None,
+        smooth_filter_width=0.1,
+        scale="linear",
+    ):
+        # if (minimum_period is None) & (maximum_period is None):
+        #     pemax = self._validate_numax(pemax)
+        # deltanu = self._validate_deltanu(deltanu)
+
+        if (not hasattr(pemax, "unit")) & (pemax is not None):
+            pemax = pemax * self.periodogram.period.unit
+        if (not hasattr(deltap, "unit")) & (deltap is not None):
+            deltap = deltap * self.periodogram.period.unit
+
+        if smooth_filter_width:
+            pgsmooth = self.periodogram.smooth(filter_width=smooth_filter_width)
+            periodd = pgsmooth.period  # Makes code below more readable below
+            power = pgsmooth.power  # Makes code below more readable below
+        else:
+            periodd = self.periodogram.period  # Makes code below more readable
+            power = self.periodogram.power  # Makes code below more readable
+
+        periodd = np.flip(periodd) #in same orientation as frequency (since frequency not in this method)
+
+        pmin = periodd[0]
+        pmax = periodd[-1]
+
+        # Check for any superfluous input
+        if (pemax is not None) & (
+            any([a is not None for a in [minimum_period, maximum_period]])
+        ):
+            warnings.warn(
+                "You have passed both a pemax and a period limit. "
+                "The period limit will override the numax input.",
+                LightkurveWarning,
+            )
+
+        # Ensure input numax is in the correct units (if there is one)
+        if pemax is not None:
+            pemax = u.Quantity(pemax, periodd.unit).value
+            if pemax > periodd[-1].value:
+                raise ValueError(
+                    "You can't pass in a numax outside the"
+                    "period range of the periodogram."
+                )
+
+            # fwhm = utils.get_fwhm(self.periodogram, numax)
+
+            # fmin = numax - 2 * fwhm
+            # if fmin < freq[0].value:
+            #     fmin = freq[0].value
+
+            # fmax = numax + 2 * fwhm
+            # if fmax > freq[-1].value:
+            #     fmax = freq[-1].value
+
+        # Set limits and set them in the right units
+        if minimum_period is not None:
+            pmin = u.Quantity(minimum_period, periodd.unit).value
+            if pmin > periodd[-1].value:
+                raise ValueError(
+                    "You can't pass in a limit outside the "
+                    "period range of the periodogram."
+                )
+
+        if maximum_period is not None:
+            pmax = u.Quantity(maximum_period, periodd.unit).value
+            if pmax > periodd[-1].value:
+                raise ValueError(
+                    "You can't pass in a limit outside the "
+                    "period range of the periodogram."
+                )
+
+        # Make sure fmin and fmax are Quantities or code below will break
+        pmin = u.Quantity(pmin, periodd.unit)
+        pmax = u.Quantity(pmax, periodd.unit)
+
+        # Add on 1x deltanu so we don't miss off any important range due to rounding
+        if pmax < periodd[-1] - 1.5 * deltap:
+            pmax += deltap
+
+        fs = np.median(np.diff(periodd))
+        x0 = int(periodd[0] / fs)
+
+        ff = periodd[int(pmin / fs) - x0 : int(pmax / fs) - x0]  # Selected frequency range
+        pp = power[int(pmin / fs) - x0 : int(pmax / fs) - x0]  # Power range
+
+        # Reshape the power into n_rows of n_columns
+        #  When modulus ~ zero, deltanu divides into frequency without remainder
+        mod_zeros = find_peaks(-1.0 * (ff % deltap))[0]
+
+        # The bottom left corner of the plot is the lowest frequency that
+        # divides into deltanu with almost zero remainder
+        start = mod_zeros[0]
+
+        # The top left corner of the plot is the highest frequency that
+        # divides into deltanu with almost zero remainder.  This index is the
+        # approximate end, because we fix an integer number of rows and columns
+        approx_end = mod_zeros[-1]
+
+        # The number of rows is the number of times you can partition your
+        #  frequency range into chunks of size deltanu, start and ending at
+        #  frequencies that divide nearly evenly into deltanu
+        n_rows = len(mod_zeros) - 1
+
+        # The number of columns is the total number of frequency points divided
+        #  by the number of rows, floor divided to the nearest integer value
+        n_columns = int((approx_end - start) / n_rows)
+
+        # The exact end point is therefore the ncolumns*nrows away from the start
+        end = start + n_columns * n_rows
+
+        ep = np.reshape(pp[start:end], (n_rows, n_columns))
+
+        if scale == "log":
+            ep = np.log10(ep)
+
+        # Reshape the freq into n_rowss of n_columnss & create arays
+        ef = np.reshape(ff[start:end], (n_rows, n_columns))
+        x_f = (ef[0, :] - ef[0, 0]) % deltap
+        y_f = np.flip(1 / ef[:, 0]) #plot frequency
+        return ep, x_f, y_f
+
+    def plot_echelle_p(
+        self,
+        deltap=None,
+        pemax=None,
+        minimum_period=None,
+        maximum_period=None,
+        smooth_filter_width=0.1,
+        scale="linear",
+        ax=None,
+        cmap="Blues",
+    ):
+        # if (minimum_frequency is None) & (maximum_frequency is None):
+        #     pemax = self._validate_numax(numax)
+        # deltanu = self._validate_deltanu(deltanu)
+
+        if (not hasattr(pemax, "unit")) & (pemax is not None):
+            pemax = pemax * self.periodogram.period.unit
+        if (not hasattr(deltap, "unit")) & (deltap is not None):
+            deltap = deltap * self.periodogram.period.unit
+
+        ep, x_f, y_f = self._clean_echelle_p(
+            pemax=pemax,
+            deltap=deltap,
+            minimum_period=minimum_period,
+            maximum_period=maximum_period,
+            smooth_filter_width=smooth_filter_width,
+        )
+
+        # Plot the echelle diagram
+        with plt.style.context(MPLSTYLE):
+            if ax is None:
+                _, ax = plt.subplots()
+            extent = (x_f[0].value, x_f[-1].value, y_f[0].value, y_f[-1].value) #yf 0 -1
+            figsize = plt.rcParams["figure.figsize"]
+            a = figsize[1] / figsize[0]
+            b = (extent[3] - extent[2]) / (extent[1] - extent[0])
+            vmin = np.nanpercentile(ep.value, 1)
+            vmax = np.nanpercentile(ep.value, 99)
+
+            im = ax.imshow(
+                ep.value,
+                cmap=cmap,
+                aspect=a / b,
+                origin="lower",
+                extent=extent,
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+            cbar = plt.colorbar(im, ax=ax, extend="both", pad=0.01)
+
+            if isinstance(self.periodogram, SNRPeriodogram):
+                ylabel = "Signal to Noise Ratio (SNR)"
+            elif self.periodogram.power.unit == cds.ppm:
+                ylabel = "Amplitude [{}]".format(
+                    self.periodogram.power.unit.to_string("latex")
+                )
+            else:
+                ylabel = "Power Spectral Density [{}]".format(
+                    self.periodogram.power.unit.to_string("latex")
+                )
+
+            if scale == "log":
+                ylabel = "log10(" + ylabel + ")"
+
+            cbar.set_label(ylabel)
+            ax.set_xlabel(r"Period mod. {:.2f}".format(deltap))
+            ax.set_ylabel(
+                r"Frequency [{}]".format(
+                    self.periodogram.frequency.unit.to_string("latex")
+                )
+            )
+            ax.set_title("Echelle diagram for {}".format(self.periodogram.label))
+
+        return ax
+
+    def _make_echelle_elements_p(
+        self,
+        deltap,
+        cmap="viridis",
+        minimum_period=None,
+        maximum_period=None,
+        smooth_filter_width=0.1,
+        scale="linear",
+        width=490,
+        height=340,
+        title="Echelle",
+    ):
+        """Helper function to make the elements of the echelle diagram for bokeh plotting."""
+        if not hasattr(deltap, "unit"):
+            deltap = deltap * self.periodogram.period.unit
+
+        if smooth_filter_width:
+            pgsmooth = self.periodogram.smooth(filter_width=smooth_filter_width)
+            periodd = pgsmooth.period  # Makes code below more readable below
+        else:
+            periodd = self.periodogram.period  # Makes code below more readable
+
+        ep, x_f, y_f = self._clean_echelle_p(
+            deltap=deltap,
+            minimum_period=minimum_period,
+            maximum_period=maximum_period,
+            smooth_filter_width=smooth_filter_width,
+            scale=scale,
+        )
+
+        fig = figure(
+            width=width,
+            height=height,
+            x_range=(0, 1),
+            y_range=(y_f[0].value, y_f[-1].value),
+            title=title,
+            tools="pan,box_zoom,reset",
+            toolbar_location="above",
+            border_fill_color="white",
+        )
+
+        fig.yaxis.axis_label = r"Frequency[{}]".format((1/periodd.unit).to_string())
+        fig.xaxis.axis_label = r"Period / {:.3f} Mod. 1".format(deltap)
+
+        lo, hi = np.nanpercentile(ep.value, [0.1, 99.9])
+        vlo, vhi = 0.3 * lo, 1.7 * hi
+        vstep = (lo - hi) / 500
+        color_mapper = LogColorMapper(palette="RdYlGn10", low=lo, high=hi)
+
+        fig.image(
+            image=[ep.value],
+            x=0,
+            y=y_f[0].value,
+            dw=1,
+            dh=y_f[-1].value,
+            color_mapper=color_mapper,
+            name="img",
+        )
+
+        stretch_slider = RangeSlider(
+            start=vlo,
+            end=vhi,
+            step=vstep,
+            title="",
+            value=(lo, hi),
+            orientation="vertical",
+            width=10,
+            height=230,
+            direction="rtl",
+            show_value=False,
+            sizing_mode="fixed",
+            name="stretch",
+        )
+
+        def stretch_change_callback(attr, old, new):
+            """TPF stretch slider callback."""
+            fig.select("img")[0].glyph.color_mapper.high = new[1]
+            fig.select("img")[0].glyph.color_mapper.low = new[0]
+
+        stretch_slider.on_change("value", stretch_change_callback)
+        return fig, stretch_slider
+
+    def interact_echelle_p(self, notebook_url="localhost:8888", **kwargs):
+        """Display an interactive Jupyter notebook widget showing an Echelle diagram.
+
+        This feature only works inside an active Jupyter Notebook, and
+        requires an optional dependency, ``bokeh`` (v1.0 or later).
+        This dependency can be installed using e.g. `conda install bokeh`.
+
+        Parameters
+        ----------
+        notebook_url : str
+            Location of the Jupyter notebook page (default: "localhost:8888")
+            When showing Bokeh applications, the Bokeh server must be
+            explicitly configured to allow connections originating from
+            different URLs. This parameter defaults to the standard notebook
+            host and port. If you are running on a different location, you
+            will need to supply this value for the application to display
+            properly. If no protocol is supplied in the URL, e.g. if it is
+            of the form "localhost:8888", then "http" will be used.
+        """
+        if _BOKEH_IMPORT_ERROR is not None:
+            log.error(
+                "The interact_echelle() tool requires the `bokeh` package; "
+                "you can install bokeh using e.g. `conda install bokeh`."
+            )
+            raise _BOKEH_IMPORT_ERROR
+
+        maximum_period = kwargs.pop(
+            "maximum_period", self.periodogram.period.max().value
+        )
+        minimum_period = kwargs.pop(
+            "minimum_period", self.periodogram.period.min().value
+        )
+
+        if not hasattr(self, "deltap"):
+            dp = SeismologyQuantity(
+                quantity=self.periodogram.period.max() / 30, #should change to *30?
+                name="deltap",
+                method="echelle",
+            )
+        else:
+            dp = 1 / self.deltap #convert to period
+
+        def create_interact_ui(doc):
+            fig_tpf, stretch_slider = self._make_echelle_elements_p(
+                dp,
+                maximum_period=maximum_period,
+                minimum_period=minimum_period,
+                **kwargs
+            )
+            maxdp = self.periodogram.period.max().value / 5 #probably shouldn't
+            # Interactive slider widgets
+            dp_slider = Slider(
+                start=0.01,
+                end=maxdp,
+                value=dp.value,
+                step=0.01,
+                title="Delta P",
+                width=290,
+            )
+            r_button = Button(label=">", button_type="default", width=30)
+            l_button = Button(label="<", button_type="default", width=30)
+            rr_button = Button(label=">>", button_type="default", width=30)
+            ll_button = Button(label="<<", button_type="default", width=30)
+
+            def update(attr, old, new):
+                """Callback to take action when dnu slider changes"""
+                dp = SeismologyQuantity(
+                    quantity=dp_slider.value * u.day,
+                    name="deltap",
+                    method="echelle",
+                )
+                ep, _, _ = self._clean_echelle_p(
+                    deltap=dp,
+                    minimum_period=minimum_period,
+                    maximum_period=maximum_period,
+                    **kwargs
+                )
+                fig_tpf.select("img")[0].data_source.data["image"] = [ep.value]
+                fig_tpf.xaxis.axis_label = r"Period / {:.3f} Mod. 1".format(dp)
+
+            def go_right_by_one_small():
+                """Step forward in time by a single cadence"""
+                existing_value = dp_slider.value
+                if existing_value < maxdp:
+                    dp_slider.value = existing_value + 0.002
+
+            def go_left_by_one_small():
+                """Step back in time by a single cadence"""
+                existing_value = dp_slider.value
+                if existing_value > 0:
+                    dp_slider.value = existing_value - 0.002
+
+            def go_right_by_one():
+                """Step forward in time by a single cadence"""
+                existing_value = dp_slider.value
+                if existing_value < maxdp:
+                    dp_slider.value = existing_value + 0.01
+
+            def go_left_by_one():
+                """Step back in time by a single cadence"""
+                existing_value = dp_slider.value
+                if existing_value > 0:
+                    dp_slider.value = existing_value - 0.01
+
+            dp_slider.on_change("value", update)
+            r_button.on_click(go_right_by_one_small)
+            l_button.on_click(go_left_by_one_small)
+            rr_button.on_click(go_right_by_one)
+            ll_button.on_click(go_left_by_one)
+
+            widgets_and_figures = layout(
+                [fig_tpf, [Spacer(height=20), stretch_slider]],
+                [
+                    ll_button,
+                    Spacer(width=30),
+                    l_button,
+                    Spacer(width=25),
+                    dp_slider,
                     Spacer(width=30),
                     r_button,
                     Spacer(width=23),
